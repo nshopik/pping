@@ -9,6 +9,8 @@ This is the first versioned release of the fork.
 
 ### Fixed
 
+- **Loader aborted when `/etc/default/pping2` was absent** — unbound `$CH_ARGS`
+  under `set -u` exited before ingest, leaving `.load` files to accumulate.
 - **`VERSION` stale at 1.2.3** — source tarballs (no `.git`) reported the wrong
   version in `-V` and the `--help` banner.
 

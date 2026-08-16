@@ -209,10 +209,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             dpkg-dev libcap2-bin shellcheck
 
-      - name: shellcheck Debian maintainer scripts
+      - name: shellcheck maintainer and contrib scripts
         run: |
           shellcheck packaging/debian/postinst
           shellcheck packaging/debian/prerm
+          shellcheck contrib/clickhouse/pping2-load.sh
 
       - name: Stage install with a fake pping2 binary
         run: |
