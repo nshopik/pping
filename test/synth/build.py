@@ -7,6 +7,7 @@ from . import (
     age_cap,
     idle,
     no_synack,
+    known,
 )
 
 
@@ -17,6 +18,7 @@ def main():
     common.write("age_cap.pcap",         age_cap.build())
     common.write("idle.pcap",            idle.build())
     common.write("no_synack.pcap",       no_synack.build())
+    common.write("known.pcap",           known.build())
 
 
 if __name__ == "__main__":

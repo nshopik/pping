@@ -19,20 +19,7 @@
 #          | awk '{$8=""; gsub(/  +/, " "); print}' | sort \
 #          > test/golden/$pcap.aggregate.golden
 # 5. Verify:  ./test/test_seq.sh && ./test/test_aggregate.sh
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PPING="$SCRIPT_DIR/../pping2"
-PCAPS_DIR="$SCRIPT_DIR/pcaps"
-GOLDEN_DIR="$SCRIPT_DIR/golden"
-
-PASS=0
-FAIL=0
-pass() { printf 'PASS %s\n' "$1"; PASS=$((PASS + 1)); }
-fail() { printf 'FAIL %s: %s\n' "$1" "$2"; FAIL=$((FAIL + 1)); }
-
-if [ ! -x "$PPING" ]; then
-    echo "ERROR: $PPING not built; run 'make' first"
-    exit 1
-fi
+. "$(dirname "$0")/lib.sh"
 
 for pcap in dns-tcp-linux dns-tcp-windows mixed-with-retx; do
     for m in ts seq hybrid; do
@@ -53,8 +40,4 @@ for pcap in dns-tcp-linux dns-tcp-windows mixed-with-retx; do
     done
 done
 
-TOTAL=$((PASS + FAIL))
-echo ""
-echo "test_seq: $PASS/$TOTAL checks passed"
-[ $FAIL -gt 0 ] && exit 1
-exit 0
+summary test_seq

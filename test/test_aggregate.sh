@@ -5,20 +5,7 @@
 #
 # Regenerating goldens: see test_seq.sh header for the full procedure;
 # the aggregate recipe uses '-a', strips col 8 (node), and pipes through sort.
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PPING="$SCRIPT_DIR/../pping2"
-PCAPS_DIR="$SCRIPT_DIR/pcaps"
-GOLDEN_DIR="$SCRIPT_DIR/golden"
-
-PASS=0
-FAIL=0
-pass() { printf 'PASS %s\n' "$1"; PASS=$((PASS + 1)); }
-fail() { printf 'FAIL %s: %s\n' "$1" "$2"; FAIL=$((FAIL + 1)); }
-
-if [ ! -x "$PPING" ]; then
-    echo "ERROR: $PPING not built"
-    exit 1
-fi
+. "$(dirname "$0")/lib.sh"
 
 # 1-3. Per-fixture golden diff. Strip col 8 (node/hostname) for portability.
 for pcap in dns-tcp-linux dns-tcp-windows mixed-with-retx; do
@@ -81,8 +68,4 @@ else
     fail "no_synack_silent_delete" "expected 0 rows; got $NS_ROWS"
 fi
 
-TOTAL=$((PASS + FAIL))
-echo ""
-echo "test_aggregate: $PASS/$TOTAL checks passed"
-[ $FAIL -gt 0 ] && exit 1
-exit 0
+summary test_aggregate
