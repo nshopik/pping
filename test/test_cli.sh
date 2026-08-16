@@ -1,19 +1,9 @@
 #!/bin/sh
 # test_cli.sh — CLI surface tests for the aggregator flags.
 # POSIX sh.
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PPING="$SCRIPT_DIR/../pping2"
-PCAP="$SCRIPT_DIR/known.pcap"
+. "$(dirname "$0")/lib.sh"
 
-PASS=0
-FAIL=0
-pass() { printf 'PASS %s\n' "$1"; PASS=$((PASS + 1)); }
-fail() { printf 'FAIL %s: %s\n' "$1" "$2"; FAIL=$((FAIL + 1)); }
-
-if [ ! -x "$PPING" ]; then
-    echo "ERROR: $PPING not built"
-    exit 1
-fi
+PCAP="$PCAPS_DIR/known.pcap"
 
 # 1. -a alone runs without error
 if "$PPING" -a -r "$PCAP" >/dev/null 2>&1; then
@@ -75,7 +65,7 @@ fi
 # Run on the existing dns-tcp-linux pcap with -c truncating mid-replay.
 # We don't assert the exact count here (depends on packet ordering); we
 # only assert that aggregator output is non-empty.
-COUNT=$("$PPING" -a -c 20 -r "$SCRIPT_DIR/pcaps/dns-tcp-linux.pcap" 2>/dev/null | wc -l | tr -d ' ')
+COUNT=$("$PPING" -a -c 20 -r "$PCAPS_DIR/dns-tcp-linux.pcap" 2>/dev/null | wc -l | tr -d ' ')
 if [ "$COUNT" -gt 0 ]; then
     pass "shutdown_flush_emits_rows"
 else
@@ -118,7 +108,7 @@ fi
 
 # 13. PPING_FILTER env var is read by the binary itself (systemd no longer
 # wraps it through sh -c). A filter matching no packets zeroes the output.
-DNSPCAP="$SCRIPT_DIR/pcaps/dns-tcp-linux.pcap"
+DNSPCAP="$PCAPS_DIR/dns-tcp-linux.pcap"
 BASE=$(PPING_FILTER= "$PPING" -a -c 20 -r "$DNSPCAP" 2>/dev/null | wc -l | tr -d ' ')
 DROP=$(PPING_FILTER="port 9999" "$PPING" -a -c 20 -r "$DNSPCAP" 2>/dev/null | wc -l | tr -d ' ')
 if [ "$BASE" -gt 0 ] && [ "$DROP" -eq 0 ]; then
@@ -135,8 +125,4 @@ else
     fail "cli_f_overrides_env" "rows=$OVER (expected >0; -f must win over env)"
 fi
 
-TOTAL=$((PASS + FAIL))
-echo ""
-echo "test_cli: $PASS/$TOTAL checks passed"
-[ $FAIL -gt 0 ] && exit 1
-exit 0
+summary test_cli

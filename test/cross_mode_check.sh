@@ -2,14 +2,9 @@
 # cross_mode_check.sh — assert TS-only flows produce identical samples in
 # --mode ts and --mode hybrid (modulo the tag column, which is 't' in both).
 # POSIX sh.
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PPING="$SCRIPT_DIR/../pping2"
-PCAP="$SCRIPT_DIR/pcaps/dns-tcp-linux.pcap"
+. "$(dirname "$0")/lib.sh"
 
-if [ ! -x "$PPING" ]; then
-    echo "ERROR: $PPING not built"
-    exit 1
-fi
+PCAP="$PCAPS_DIR/dns-tcp-linux.pcap"
 
 TS=$(mktemp); HY=$(mktemp)
 trap 'rm -f "$TS" "$HY"' EXIT INT TERM

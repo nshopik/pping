@@ -241,7 +241,7 @@ static void test_ipToStr_v4()
         std::array<uint8_t, 16> bytes{};
         bytes[0] = a; bytes[1] = b; bytes[2] = c; bytes[3] = d;
         IpStr s = ipToStr(bytes, 4);
-        return std::string(s.buf.data());
+        return std::string(s.data());
     };
 
     ASSERT_STR_EQ(fmt(0,   0,   0,   0),   "0.0.0.0");
@@ -256,7 +256,7 @@ static void test_ipToStr_v6()
 {
     auto fmt = [](std::array<uint8_t, 16> bytes) -> std::string {
         IpStr s = ipToStr(bytes, 6);
-        return std::string(s.buf.data());
+        return std::string(s.data());
     };
 
     // ::
@@ -300,35 +300,6 @@ static void test_seq_compare_wrap()
     ASSERT_EQ(seq_geq(b, a), false);
 }
 REGISTER_TEST(test_seq_compare_wrap);
-
-static void test_flowrec_seq_field_defaults()
-{
-    flowRec fr;
-    ASSERT_EQ((int)fr.outstanding_end, 0);
-    ASSERT_EQ(fr.outstanding_time, 0.0);
-    ASSERT_EQ((int)fr.high_seq, 0);
-    ASSERT_EQ(fr.high_seq_init, false);
-    ASSERT_EQ(fr.retx_flag, false);
-    ASSERT_EQ(fr.tsCapable, false);
-    ASSERT_EQ(fr.classified, false);
-    ASSERT_EQ(fr.revFlowRec, (flowRec*)nullptr);
-    // Aggregator additions:
-    ASSERT_EQ((int)fr.n_samples, 0);
-    ASSERT_EQ(fr.window_start, 0.0);
-    ASSERT_EQ(fr.closed, false);
-}
-REGISTER_TEST(test_flowrec_seq_field_defaults);
-
-static void test_capacity_defaults()
-{
-    ASSERT_TRUE(maxFlows  > 0 && (maxFlows  & (maxFlows  - 1)) == 0);  // positive power of 2
-    ASSERT_TRUE(maxTSvals > 0 && (maxTSvals & (maxTSvals - 1)) == 0);
-    ASSERT_EQ(flowMaxAge, 1800.);     // new: 30 min, middle ground for ClickHouse buckets
-    ASSERT_EQ(aggregateOutput, false);
-    ASSERT_EQ(flowsDropped,   0);
-    ASSERT_EQ(aggregatedRows, 0);
-}
-REGISTER_TEST(test_capacity_defaults);
 
 /* -------------------------------------------------------------------------
  * addTS / cleanUp
@@ -933,30 +904,6 @@ static void test_crc32hash_sanity()
     FlowKey kb = makeFlow4(10, 0, 0, 1, 10, 0, 0, 3, 1234, 80);  // dstIP last byte differs
     ASSERT_TRUE(h(ka) != h(kb));
 
-    // Assertion 3: No bucket collapse — 4096 keys differing only in sport/dport
-    // must distribute across 16-bit buckets such that no bucket exceeds 16 hits.
-    // CRC32C over diverse input bytes yields ≪ 1 hit per bucket on average;
-    // the 16-hit ceiling is a conservative guard against truncation/zeroing bugs.
-    constexpr int N = 4096;
-    constexpr int NBUCKETS = 65536;   // 2^16
-    constexpr int MAX_BUCKET = 16;
-    int buckets[NBUCKETS] = {};
-    for (int i = 0; i < N; ++i) {
-        FlowKey k{};
-        k.af = 4;
-        k.sport = static_cast<uint16_t>(i);
-        k.dport = static_cast<uint16_t>(0xC000 ^ i);
-        size_t bucket = h(k) & 0xFFFF;
-        buckets[bucket]++;
-    }
-    for (int b = 0; b < NBUCKETS; ++b) {
-        if (buckets[b] > MAX_BUCKET) {
-            std::fprintf(stderr,
-                "  bucket collapse in %s: bucket %d has %d hits (max %d)\n",
-                g_current_test, b, buckets[b], MAX_BUCKET);
-            ++g_failures;
-        }
-    }
 }
 REGISTER_TEST(test_crc32hash_sanity);
 

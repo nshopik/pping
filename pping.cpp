@@ -106,10 +106,8 @@
 
 using namespace Tins;
 
-// Packed POD key for flow lookup. 40B total: 16+16+2+2+1 = 37 named bytes,
-// then 3B trailing pad after `af`. Default member initializers zero everything
-// (including _pad), so `FlowKey k;` produces a key whose padding bytes are
-// guaranteed zero — required so memcmp/CRC32Hash agree across construction sites.
+// Packed POD key for flow lookup. Default member initializers zero the padding
+// too — required so memcmp/CRC32Hash agree across construction sites.
 struct FlowKey {
     std::array<uint8_t, 16> srcIP{};   // v4 in first 4 bytes, rest zero
     std::array<uint8_t, 16> dstIP{};
@@ -133,7 +131,7 @@ struct FlowKey {
 };
 static_assert(sizeof(FlowKey) == 40, "FlowKey size changed; tests rely on this");
 
-// FlowKey + tsval. 40 + 4 named + 4B pad = 48B. Same zero-pad invariant.
+// FlowKey + tsval. Same zero-pad invariant.
 struct TsKey {
     FlowKey flow{};
     uint32_t tsval = 0;
@@ -145,11 +143,8 @@ struct TsKey {
 };
 static_assert(sizeof(TsKey) == 48, "TsKey size changed; tests rely on this");
 
-// Hardware CRC32C over the raw bytes of T in 8-byte strides.
-// Padding participates — that's why the zero-pad invariant above is load-bearing.
-// sizeof(T) is compile-time known; GCC at -O3 unrolls the loop fully
-// (5 strides for FlowKey/40B, 6 strides for TsKey/48B) — no residual loop.
-// Requires sizeof(T) % 8 == 0 (enforced by static_assert).
+// Hardware CRC32C over the raw bytes of T in 8-byte strides. Padding
+// participates, hence the zero-pad invariant above.
 struct CRC32Hash {
     template<class T>
     size_t operator()(const T& k) const noexcept {
@@ -168,26 +163,14 @@ struct CRC32Hash {
 
 // Wrap-safe TCP sequence-number comparison. Treats a, b as points on a
 // 2^32 cycle; correct as long as |a - b| < 2^31 (RFC 1323 PAWS bound).
-// Used unconditionally on the SEQ-path hot path; cost is sub/sign-compare.
 static inline bool seq_lt(uint32_t a, uint32_t b) noexcept {
     return int32_t(a - b) < 0;
 }
 static inline bool seq_geq(uint32_t a, uint32_t b) noexcept {
     return int32_t(a - b) >= 0;
 }
-// TCP payload length from a libtins TCP PDU. inner_pdu()->size() if present;
-// otherwise zero (pure ACK / SYN / FIN / RST). Safe on truncated frames.
-static inline uint32_t tcp_payload_len(const TCP* t_tcp) noexcept {
-    const PDU* inner = t_tcp->inner_pdu();
-    return inner ? static_cast<uint32_t>(inner->size()) : 0u;
-}
 
-class flowRec
-{
-  public:
-    flowRec() = default;
-    ~flowRec() = default;
-
+struct flowRec {
     double last_tm{};
     double min{1e30};   // current min value for capturepoint-to-source RTT
     double bytesSnt{};  // number of bytes sent through CP toward dst
@@ -200,10 +183,8 @@ class flowRec
                         // match on TSval entry by reverse flow, i.e. the number of bytes
                         // departed through CP the last time an RTT was computed for this stream
     bool revFlow{};             //inidcates if a reverse flow has been seen
-    // Peer flowRec* — set when both directions are first observed, nulled on
-    // peer expiry. Lets the SEQ ACK fast-path skip the per-packet flows.find(rk).
-    // revFlow stays sticky-true for the TS-path early-return logic; revFlowRec
-    // is lifecycle-managed because it must never dangle.
+    // Peer flowRec, nulled on peer expiry so it can never dangle. revFlow stays
+    // sticky-true; revFlowRec does not.
     flowRec* revFlowRec{nullptr};
 
     // SEQ-path state (used in --mode seq and --mode hybrid for non-TS flows)
@@ -214,14 +195,9 @@ class flowRec
     bool     retx_flag{false};     // strict Karn: invalidate sample if set
 
     // Aggregator state (used in --aggregate mode for per-flow rows).
-    uint32_t n_samples    = 0;        // RTT matches counted in current window;
-                                      // resets on age-cap fire.
-    double   window_start = 0.;       // capTm at flow creation (or last age-cap reset).
-                                      // 0.0 means "not yet seen a packet" — process_packet
-                                      // sets it on the inserted branch.
-    bool     closed       = false;    // first FIN observed on this direction's flowRec,
-                                      // or RST observed on either direction (peer's flag
-                                      // is set via revFlowRec from the RST-receiving side).
+    uint32_t n_samples    = 0;        // RTT matches in current window; reset on age-cap
+    double   window_start = 0.;       // capTm at flow creation or last age-cap reset
+    bool     closed       = false;    // FIN on this direction, or RST on either
 
     // Set once on first packet through process_packet, then never modified.
     bool     tsCapable{false};
@@ -235,44 +211,21 @@ struct tsInfo {
 };
 
 // Open-addressing flat maps (ankerl::unordered_dense): entries stored inline in
-// a contiguous array, power-of-2 bucket index (AND, not modulo). Replaced
-// std::unordered_map, whose node-per-entry layout pointer-chased into scattered
-// heap at ~590K live flows. Measured ~11% fewer ns/pkt on the -a hybrid path and
-// ~56% fewer LLC cache misses (real-kernel perf stat); peak RSS ~6% lower.
-// `flows` keeps flowRec* values, so revFlowRec (a raw flowRec*) is never
-// invalidated by a rehash — only the inline pointer slots relocate, not the
-// heap flowRec objects they point at.
+// a contiguous array. `flows` keeps flowRec* values, so revFlowRec is never
+// invalidated by a rehash — only the inline pointer slots relocate.
 static ankerl::unordered_dense::map<FlowKey, flowRec*, CRC32Hash> flows;
 static ankerl::unordered_dense::map<TsKey,   tsInfo,   CRC32Hash> tsTbl;
 
-// Allocation-free IP-to-string formatter.  Wraps inet_ntop() with a
-// stack buffer sized for the longest IPv6 textual form.  Replaces
-// ipToString (which goes through libtins IPv{4,6}Address::to_string,
-// which uses std::ostringstream internally — visible in profiles as
-// _M_insert<unsigned long> and ~basic_ostringstream).
-//
-// `bytes` holds the address in network byte order: the first 4 bytes
-// for AF_INET, all 16 for AF_INET6 — matching the existing FlowKey
-// invariant.  `af` is 4 or 6, as elsewhere in pping.
-struct IpStr {
-    std::array<char, INET6_ADDRSTRLEN> buf;   // 46 bytes; always NUL-terminated
-};
+// Allocation-free IP-to-string formatter: inet_ntop() into a stack buffer,
+// avoiding libtins IPv{4,6}Address::to_string and its std::ostringstream.
+// `bytes` is network byte order, first 4 for AF_INET, all 16 for AF_INET6.
+using IpStr = std::array<char, INET6_ADDRSTRLEN>;
 
 static inline IpStr ipToStr(const std::array<uint8_t, 16>& bytes, uint8_t af) noexcept
 {
     IpStr s{};
-    inet_ntop(af == 4 ? AF_INET : AF_INET6,
-              bytes.data(), s.buf.data(), s.buf.size());
+    inet_ntop(af == 4 ? AF_INET : AF_INET6, bytes.data(), s.data(), s.size());
     return s;
-}
-
-// Human-readable "src:port+dst:port". Errors + human output only.
-static inline std::string flowKeyName(const FlowKey& k)
-{
-    IpStr s = ipToStr(k.srcIP, k.af);
-    IpStr d = ipToStr(k.dstIP, k.af);
-    return std::string(s.buf.data()) + ":" + std::to_string(k.sport)
-         + "+" + std::string(d.buf.data()) + ":" + std::to_string(k.dport);
 }
 
 #define SNAP_LEN 144                // maximum bytes per packet to capture
@@ -337,12 +290,8 @@ static int64_t nextFlush;       // next stdout flush time (~uS)
 
 static inline void addTS(const TsKey& key, const tsInfo& ti)
 {
-    // Below cap: try_emplace gives first-write-wins for free.
-    // At cap: count the rejection and skip the insert. We deliberately do NOT
-    // disambiguate new-vs-existing keys here — the old `find()` cost a full
-    // 48-byte hash + bucket probe on every packet while saturated, just to
-    // refine a diagnostic counter. tsDropped now counts all packets rejected
-    // at cap (a duplicate key would have been a no-op insert anyway).
+    // try_emplace gives first-write-wins. At cap, tsDropped counts every
+    // rejected packet, not just the ones whose key was new.
     if (tsTbl.size() < maxTSvals) {
         tsTbl.try_emplace(key, ti);
     } else {
@@ -400,6 +349,15 @@ static int64_t clock_now(void) {
     return (int64_t(tv.tv_sec) << 20) | tv.tv_usec;
 }
 
+static void maybeFlush()
+{
+    int64_t now = clock_now();
+    if (now - nextFlush >= 0) {
+        nextFlush = now + flushInt;
+        fflush(stdout);
+    }
+}
+
 // Shared output helper for both the TS and SEQ paths. `tag` is 't' (TS path)
 // or 's' (SEQ path); always emitted for -e and human formats, omitted from -m.
 static void emit(double rtt, flowRec* fr, const FlowKey& fk,
@@ -412,21 +370,19 @@ static void emit(double rtt, flowRec* fr, const FlowKey& fk,
         printf("%" PRId64 ".%06d %.6f %.6f %.0f %.0f %.0f %s %u %s %u %s %c\n",
                 int64_t(capTm + offTm), int((capTm - floor(capTm)) * 1e6),
                 rtt, fr->min, fBytes, dBytes, pBytes,
-                ipsstr.buf.data(), fk.sport,
-                ipdstr.buf.data(), fk.dport,
+                ipsstr.data(), fk.sport,
+                ipdstr.data(), fk.dport,
                 node.c_str(),
                 tag);
     } else if (machineReadable) {
         printf("%" PRId64 ".%06d %.6f %s %s\n",
                 int64_t(capTm + offTm), int((capTm - floor(capTm)) * 1e6),
-                rtt, ipsstr.buf.data(), ipdstr.buf.data());
+                rtt, ipsstr.data(), ipdstr.data());
     } else {
         std::time_t result = static_cast<std::time_t>(int64_t(capTm + offTm));
-        // Cache the formatted %T string per integer second.  Otherwise
-        // std::localtime() triggers glibc's __tzset_internal which stat()s
-        // /etc/localtime on every call (15.22% kernel + 10.58% libc-side
-        // in the hot-path profile).  Same wall-clock second → reuse buffer.
-        // Single-threaded; if pping ever threads, make these thread-local.
+        // Cache the formatted %T string per integer second: std::localtime()
+        // stat()s /etc/localtime on every call. Single-threaded; make these
+        // thread-local if pping ever threads.
         static std::time_t cachedSec = 0;
         static char tbuff[16];
         if (result != cachedSec) {
@@ -438,20 +394,15 @@ static void emit(double rtt, flowRec* fr, const FlowKey& fk,
         printf("%s %s %s %s:%u+%s:%u [%c]\n",
                tbuff, fmtTimeDiff(rtt).c_str(),
                fmtTimeDiff(fr->min).c_str(),
-               ipsstr.buf.data(), fk.sport, ipdstr.buf.data(), fk.dport,
+               ipsstr.data(), fk.sport, ipdstr.data(), fk.dport,
                tag);
     }
-    int64_t now = clock_now();
-    if (now - nextFlush >= 0) {
-        nextFlush = now + flushInt;
-        fflush(stdout);
-    }
+    maybeFlush();
 }
 
-// Aggregator output helper — emits one row per flow per closure-or-window event.
-// Called only from cleanUp; invariant: caller has verified n_samples > 0 and
-// aggregateOutput == true. Row timestamp uses fr->last_tm (not capTm at the
-// cleanUp tick) so emission time matches the last packet seen on this flow.
+// Aggregator output helper — one row per flow per closure-or-window event.
+// Called only from cleanUp, which has verified n_samples > 0 and
+// aggregateOutput. Row timestamp is fr->last_tm, not capTm at the cleanUp tick.
 // Format: "epoch.usec min_rtt n_samples srcIP sport dstIP dport node tag\n"
 static void emit_aggregated(const flowRec* fr, const FlowKey& fk)
 {
@@ -461,15 +412,11 @@ static void emit_aggregated(const flowRec* fr, const FlowKey& fk)
            int64_t(fr->last_tm + offTm),
            int((fr->last_tm - floor(fr->last_tm)) * 1e6),
            fr->min, fr->n_samples,
-           ipsstr.buf.data(), fk.sport,
-           ipdstr.buf.data(), fk.dport,
+           ipsstr.data(), fk.sport,
+           ipdstr.data(), fk.dport,
            node.c_str(),
            fr->tsCapable ? 't' : 's');
-    int64_t now = clock_now();
-    if (now - nextFlush >= 0) {
-        nextFlush = now + flushInt;
-        fflush(stdout);
-    }
+    maybeFlush();
 }
 
 static void process_packet(const Packet& pkt)
@@ -523,9 +470,8 @@ static void process_packet(const Packet& pkt)
     flowRec* fr;
     if (inserted) {
         if (flowCnt >= maxFlows) {
-            // Cap rejection — increment counter; the per-packet stderr line
-            // was removed because at high pps it would flood stderr. Counter
-            // surfaces in printSummary as "<n> flows dropped (cap),".
+            // Counted, not logged: at high pps a per-packet line floods stderr.
+            // printSummary reports it as "<n> flows dropped (cap),".
             ++flowsDropped;
             flows.erase(fit);
             return;
@@ -590,19 +536,14 @@ static void process_packet(const Packet& pkt)
     double arr_fwd = fr->bytesSnt + pkt.pdu()->size();
     fr->bytesSnt = arr_fwd;
 
-    // Mode dispatch.
-    const bool useSeq =
-        (mode == Mode::SEQ) ||
-        (mode == Mode::HYBRID && !fr->tsCapable);
-    const bool useTs =
-        (mode == Mode::TS && fr->tsCapable) ||
-        (mode == Mode::HYBRID && fr->tsCapable);
-
+    // --mode ts drops non-TS flows, counted as no_TS.
     if (mode == Mode::TS && !fr->tsCapable) {
-        // --mode ts drops non-TS flows, counted as no_TS.
         no_TS++;
         return;
     }
+    // Past that return the two paths are complements: TS-capable flows take
+    // the TS path unless --mode seq forces SEQ; everything else takes SEQ.
+    const bool useTs = fr->tsCapable && mode != Mode::SEQ;
 
     bool toLocal = filtLocal && localIPaf == fk.af
                 && std::memcmp(localIPBytes.data(), fk.dstIP.data(), 16) == 0;
@@ -631,26 +572,21 @@ static void process_packet(const Packet& pkt)
             double dBytes = eit->second.dBytes;
             double pBytes = arr_fwd - fr->lstBytesSnt;
             fr->lstBytesSnt = arr_fwd;
-            // Use the cached reverse-flow pointer; null when peer expired
-            // (equivalent to the prior flows.find(rk) miss). Note: if the peer
-            // expires and is later re-created with the same FlowKey, the cached
-            // pointer stays null until *this* flow itself is re-inserted (the
-            // linkage at line ~434 only fires on the inserted branch). The
-            // original flows.find(rk) would have re-discovered the recycled
-            // peer and written bytesDep to a fresh-but-unrelated flowRec; the
-            // new behavior is strictly more conservative.
+            // Null when the peer expired. A peer re-created under the same
+            // FlowKey stays unlinked until this flow is itself re-inserted, so
+            // bytesDep is never written to an unrelated flowRec.
             if (fr->revFlowRec) fr->revFlowRec->bytesDep = fBytes;
             if (!aggregateOutput) {
                 emit(rtt, fr, fk, fBytes, dBytes, pBytes, /*tag=*/'t');
             }
             eit->second.t = -t;
         }
-    }
-
-    if (useSeq) {
+    } else {
         const uint32_t seq    = t_tcp->seq();
         const auto     flags  = t_tcp->flags();
-        const uint32_t pay    = tcp_payload_len(t_tcp);
+        // Payload length: zero on a pure ACK / SYN / FIN / RST.
+        const PDU*     inner  = t_tcp->inner_pdu();
+        const uint32_t pay    = inner ? static_cast<uint32_t>(inner->size()) : 0u;
         const uint32_t eff_len = pay
                                + ((flags & TCP::SYN) ? 1u : 0u)
                                + ((flags & TCP::FIN) ? 1u : 0u);
@@ -685,7 +621,6 @@ static void process_packet(const Packet& pkt)
         // the in-flight measurement on the forward (reverse-of-this-packet) flow.
         if (flags & TCP::ACK) {
             const uint32_t ack = t_tcp->ack_seq();
-            // Cached reverse-flow pointer; replaces a per-ACK flows.find(rk).
             // Null when the peer has expired (cleanUp unlinks before delete).
             flowRec* rr = fr->revFlowRec;
             if (rr && rr->outstanding_end != 0 && seq_geq(ack, rr->outstanding_end)) {
@@ -730,26 +665,17 @@ static void cleanUp(double n, bool flush_all = false)
     for (auto it = flows.begin(); it != flows.end();) {
         flowRec* fr = it->second;
 
-        // Determine emission reason. Priority: shutdown-flush > closed > idle > age-cap.
-        // shutdown-flush emits any flow with samples regardless of trigger.
-        bool emit_now    = false;
-        bool delete_after = false;
+        // Shutdown flush, close, and idle all retire the flow; the age-cap
+        // only rolls its window over.
+        const bool retire = flush_all || fr->closed || n - fr->last_tm > flowMaxIdle;
+        bool emit_now     = false;
         bool reset_window = false;
 
-        if (flush_all) {
+        if (retire) {
             emit_now = aggregateOutput && fr->n_samples > 0;
-            delete_after = true;
-        } else if (fr->closed) {
-            emit_now = aggregateOutput && fr->n_samples > 0;
-            delete_after = true;
-        } else if (n - fr->last_tm > flowMaxIdle) {
-            emit_now = aggregateOutput && fr->n_samples > 0;
-            delete_after = true;
         } else if (aggregateOutput && flowMaxAge > 0. && capTm - fr->window_start > flowMaxAge) {
-            // Age-cap is aggregator-only: resetting fr->min/lstBytesSnt
-            // for non-agg modes would mid-stream-clear the running minRTT
-            // exposed in -e/-m/human output, violating the spec's
-            // "bit-for-bit unchanged" guarantee for those modes.
+            // Aggregator-only: resetting fr->min for -e/-m/human output would
+            // clear the running minRTT those formats expose mid-stream.
             emit_now = fr->n_samples > 0;
             reset_window = true;
         }
@@ -759,7 +685,7 @@ static void cleanUp(double n, bool flush_all = false)
             ++aggregatedRows;
         }
 
-        if (delete_after) {
+        if (retire) {
             // Unlink peer's cached pointer before delete to avoid dangling.
             if (fr->revFlowRec) fr->revFlowRec->revFlowRec = nullptr;
             delete fr;
@@ -830,24 +756,19 @@ static std::string localAddrOf(const std::string& ifname)
 
 static void handleSignal(int) { stopRequested = 1; }
 
-// Async-signal-safe: only writes the volatile flag. Do NOT call
-// reopenLogfile() from here — it uses fflush/open/dup2/close which
-// are not async-signal-safe per signal-safety(7). The flag is
-// consumed on the main thread inside the packet loop.
+// Do NOT call reopenLogfile() from here: fflush/open/dup2/close are not
+// async-signal-safe per signal-safety(7). The packet loop consumes the flag.
 static void handleSighup(int) { reopenRequested = 1; }
 
-// Reopen the --logfile path: open a fresh fd, dup2 onto stdout, close the
-// extra fd. Used at startup (before the packet loop) and from the main loop
-// when reopenRequested is set by SIGHUP. On reopen failure we keep the
-// existing stdout — never silently lose output.
+// Called at startup and on SIGHUP. On failure the existing stdout is kept,
+// so output is never silently lost.
 static bool reopenLogfile(const char* path)
 {
     fflush(stdout);
-    // O_NOFOLLOW + 0640: refuse to follow symlinks at the path (closes
-    // the nobody-RCE-to-root-write chain when --logfile points into the
-    // nobody-owned /var/log/pping2/ — see also the dropPrivileges ordering
-    // in main()), and tighten the mode so per-flow metadata (src/dst
-    // IPs, ports, RTTs) isn't world-readable.
+    // O_NOFOLLOW: refuse to follow a symlink planted at the path, which would
+    // otherwise turn an RCE as nobody into a root-owned write via the
+    // nobody-owned /var/log/pping2/. 0640 keeps per-flow src/dst IPs, ports
+    // and RTTs off world-readable.
     int fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0640);
     if (fd < 0) return false;
     int rc = dup2(fd, STDOUT_FILENO);
@@ -1117,12 +1038,9 @@ int main(int argc, char* const* argv)
         config.set_promisc_mode(false);
         config.set_snap_len(SNAP_LEN);
         config.set_timeout(250);
-        // Size the kernel capture ring. libpcap defaults to ~2MB, which at
-        // 10G line rate holds only a few thousand frames — any packet-loop
-        // stall (cleanUp scan, scheduler jitter, output burst) then overflows
-        // the ring and drops packets silently (counted by pcap_stats, not by
-        // pping). 16MB holds ~30k min-size frames, enough to ride out a stall.
-        // No effect on FileSniffer (pcap replay), so set unconditionally.
+        // libpcap's ~2MB default capture ring overflows on any packet-loop
+        // stall at 10G. 16MB holds ~30k min-size frames. No effect on
+        // FileSniffer, so set unconditionally.
         config.set_buffer_size(16 * 1024 * 1024);
 
         try {
@@ -1149,10 +1067,9 @@ int main(int argc, char* const* argv)
                 }
             } else {
                 snif = new FileSniffer(fname, config);
-                // pcap mode: no local-host concept, so disable the filter
-                // explicitly. Otherwise filtLocal stays true and only the
-                // localIPaf == 0 branch in process_packet keeps the filter
-                // from misfiring — fragile if anyone touches that init.
+                // No local-host concept in pcap mode. Disable explicitly
+                // rather than rely on the localIPaf == 0 branch in
+                // process_packet.
                 filtLocal = false;
             }
         } catch (std::exception& ex) {
@@ -1160,11 +1077,9 @@ int main(int argc, char* const* argv)
             exit(EXIT_FAILURE);
         }
     }
-    // Drop before opening --logfile so the open() runs as nobody. With
-    // O_NOFOLLOW in reopenLogfile() this is belt-and-suspenders, but it
-    // also means even if a future change drops O_NOFOLLOW, root never
-    // touches paths under nobody-owned /var/log/pping2/ — a symlink
-    // planted there by a nobody-compromised process can't escalate.
+    // Drop before opening --logfile so the open() runs as nobody: root then
+    // never touches a path under nobody-owned /var/log/pping2/ even if a
+    // future change loses the O_NOFOLLOW in reopenLogfile().
     dropPrivileges("nobody");
     if (!logfilePath.empty()) {
         if (!reopenLogfile(logfilePath.c_str())) {
@@ -1251,40 +1166,23 @@ int main(int argc, char* const* argv)
         }
     }
 
-    // Aggregator shutdown flush: drain every live flow with samples to
-    // guarantee no in-progress accumulator state is silently dropped on
-    // graceful exit (signal, end of pcap, -c, -s, --seconds).
+    // Drain every live flow with samples so no accumulator state is dropped
+    // on graceful exit (signal, end of pcap, -c, -s).
     if (aggregateOutput) {
         cleanUp(capTm, /*flush_all=*/true);
     }
 
-    // Live capture only: report cumulative kernel capture-loss stats once at
-    // shutdown. pping's tsDropped/flowsDropped counters are application-level
-    // rejections; these are packets the kernel dropped before pping ever saw
-    // them (capture-ring overflow), which biases measured RTT high because the
-    // first-TSval<->first-TSecr pairing is no longer guaranteed. pcap_stats is
-    // a no-op (returns -1) on a FileSniffer savefile, so guard on liveInp.
+    // Kernel capture-ring drops, which happen before pping sees the packet and
+    // bias RTT high. pcap_stats returns -1 on a FileSniffer savefile, so this
+    // is live-capture only. ps_drop updates at block granularity under
+    // TPACKET_V3, so a sub-second microburst can be lost without showing here.
+    // ps_ifdrop is reported raw, not folded into the percentage: most Linux NIC
+    // drivers never increment it, so "0 ifdrop" means unreported.
     if (liveInp) {
-        // Value-initialize: libpcap only fills the fields it knows, and the
-        // struct carries extra fields on non-Linux ports.
+        // Value-initialized: libpcap fills only the fields it knows.
         struct pcap_stat ps{};
         if (pcap_stats(snif->get_pcap_handle(), &ps) == 0) {
-            // Loss fraction = ps_drop / (ps_recv + ps_drop). On Linux + libpcap
-            // >=1.0 ps_recv excludes drops, so this denominator is exact; on
-            // older/non-Linux libpcap ps_recv may include drops and this
-            // under-reports. ps_recv/ps_drop are u_int -> promote to double or
-            // the ratio truncates to integer 0.
-            //
-            // ps_drop is kernel capture-ring overflow, cumulative since the
-            // handle was opened. With TPACKET_V3 block-mode rings the kernel
-            // updates it lazily (block granularity), so a sub-second microburst
-            // can lose packets without showing here -- "0 drop" is reassuring,
-            // not a guarantee. (Resets if the handle is ever re-opened; not done
-            // today.)
-            //
-            // ps_ifdrop (driver rx_dropped) is reported raw, NOT folded into the
-            // percentage: most Linux NIC drivers never increment it, so "0
-            // ifdrop" means "unreported", not "NIC kept up".
+            // u_int operands; promote or the ratio truncates to 0.
             unsigned long long denom =
                 (unsigned long long)ps.ps_recv + ps.ps_drop;
             double lossPct = denom ? 100.0 * ps.ps_drop / denom : 0.0;
@@ -1294,10 +1192,8 @@ int main(int argc, char* const* argv)
         }
     }
 
-    // File-mode only: wall-clock measures CPU-bound replay throughput, which
-    // is the useful benchmark number. Live capture is bounded by what arrives
-    // on the wire, not by pping, so the same number would just describe the
-    // network's quietness.
+    // Wall-clock is the replay-throughput benchmark. Live capture is bounded
+    // by the wire, not by pping, so the number would be meaningless there.
     if (!liveInp) {
         clock_gettime(CLOCK_MONOTONIC, &wallEnd);
         double wallSec = (wallEnd.tv_sec - wallStart.tv_sec) +
