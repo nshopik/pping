@@ -7,6 +7,11 @@ This is the first versioned release of the fork.
 
 ## Unreleased
 
+### Fixed
+
+- **`VERSION` stale at 1.2.3** — source tarballs (no `.git`) reported the wrong
+  version in `-V` and the `--help` banner.
+
 ## v1.2.4 — 2026-07-21
 
 ### Added
