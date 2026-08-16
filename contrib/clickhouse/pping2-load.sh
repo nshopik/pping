@@ -16,6 +16,7 @@ log() {
     logger -s -t pping2-load -p "daemon.$level" -- "$*"
 }
 
+# shellcheck source=/dev/null  # runtime config, not present at lint time
 [ -r /etc/default/pping2 ] && . /etc/default/pping2
 
 # tr ' ' '\t' below assumes no spaces inside fields. Holds for current
@@ -39,8 +40,9 @@ exec 9>"$LOCKFILE"
 flock -n 9 || { log info "another pping2-load holds $LOCKFILE; skipping this run"; exit 0; }
 
 ingest_via_clickhouse_client() {
+    # shellcheck disable=SC2086  # CH_ARGS is a space-separated arg list; must word-split
     tr ' ' '\t' < "$LOADFILE" \
-      | clickhouse-client $CH_ARGS --query="INSERT INTO ${TABLE} FORMAT TSV"
+      | clickhouse-client ${CH_ARGS:-} --query="INSERT INTO ${TABLE} FORMAT TSV"
 }
 
 ingest_via_curl() {
@@ -56,6 +58,7 @@ ingest_via_curl() {
         enc_header=(-H 'Content-Encoding: zstd')
     fi
 
+    # shellcheck disable=SC2086  # CH_CURL_OPTS is a space-separated flag list; must word-split
     {
         echo "INSERT INTO ${full_table} FORMAT TabSeparated"
         tr ' ' '\t' < "$LOADFILE"
